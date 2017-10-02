@@ -128,7 +128,7 @@ ucb banditStats curRound  =
       in
     if totalTimesPulled /= 0 then empiricalMean + confidence else maxDouble
   where
-    maxDouble = 100000000
+    maxDouble = 100000000 -- TODO: What's the actual max double?
 
 main :: IO ()
 main = do

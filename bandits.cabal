@@ -36,6 +36,7 @@ executable bandits-exe
                      , microlens
                      , microlens-th
                      , optparse-generic
+                    
   default-language:    Haskell2010
 
 test-suite bandits-test

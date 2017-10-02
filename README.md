@@ -1,3 +1,3 @@
 # bandits
 
-add description of bandits here
+Implementation of the Upper Confidence Bound multi-armed bandit strategy.

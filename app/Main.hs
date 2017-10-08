@@ -2,7 +2,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
-{-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE RankNTypes #-}
@@ -12,15 +11,14 @@
 
 module Main where
 
--- import Lib
 import qualified Statistics.Distribution as Stat
 import qualified Statistics.Distribution.Normal as Stat
+import qualified Statistics.Distribution.Uniform as Stat
 import Control.Monad.Primitive
 import qualified System.Random.MWC as Rand
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Lens.Micro
-import Lens.Micro.Internal
 import Types
 import qualified Data.List as List
 import Options.Generic
@@ -30,10 +28,10 @@ type BanditM m = (MonadIO m, MonadReader (Rand.Gen (PrimState IO)) m)
 
 -- |Generate a list of random bandits using dist to generate their parameters.
 randomBandits ::
-  BanditM m
+  (BanditM m, Stat.ContGen d1, Stat.ContGen d2)
   => Int
-  -> BanditDist
-  -> BanditDist
+  -> d1
+  -> d2
   -> m [Bandit BanditDist]
 randomBandits count avgDist stdDevDist =
   replicateM count randomBandit
@@ -46,8 +44,8 @@ randomBandits count avgDist stdDevDist =
 
 -- |Pulls the handle and returns the reward
 pullArm ::
-  BanditM m
-  => Bandit BanditDist
+  (BanditM m, Stat.ContGen d)
+  => Bandit d
   -> m BanditStats
 pullArm (Bandit d) = do
   gen <- ask
@@ -58,16 +56,17 @@ simulate ::
   BanditM m
   => SimState -- ^ Starting state
   -> Int      -- ^ Number of rounds
-  -> (SimState -> Traversal' SimState (IxValue [BanditState])) -- ^ Choosing function
+  -> (SimState -> m Int) -- ^ Choosing function
   -> m SimState
 simulate simState 0 _ = return simState
 simulate simState rounds f = do
-  let Just (chosenStat, chosenBandit) = simState ^? f simState -- Pick a bandit
+  chosenIndex <- f simState
+  let Just (chosenStat, chosenBandit) = simState ^? bandits. ix chosenIndex -- Pick a bandit
   newStat <- pullArm chosenBandit
   let newState = simState
-                 & (f simState) . _1 .~ (chosenStat `mappend` newStat) -- Update stats
+                 & (bandits . ix chosenIndex) . _1 .~ (chosenStat `mappend` newStat) -- Update stats
                  & roundsCount %~ (+1) -- Update rounds count
-                 & regretHist %~ (regret simState :)
+                 & regretHist %~ (\t -> (regret simState) : t)
   simulate newState (rounds - 1) f
 
 -- | Initialize the state but creating the specified number of bandits and pulling each
@@ -77,7 +76,7 @@ initState ::
   => Int -- Number of bandits
   -> m SimState
 initState count = do
-  initBandits <- randomBandits count (Stat.normalDistr 0 5) (Stat.normalDistr 0 5)
+  initBandits <- randomBandits count (Stat.uniformDistr 0 50) (Stat.normalDistr 0 5)
   let initStats = replicate count mempty
   return $ SimState (zip initStats initBandits) 0 []
 
@@ -92,11 +91,13 @@ regret simState =
   in
     maxExpectedReturn - actualExpectedReturn
 
+type Concrete a = (ReaderT (Rand.Gen (PrimState IO)) IO) a
+
 run ::
   Int
   -> Int
-  -> (SimState -> Traversal' SimState (IxValue [BanditState]))
-  -> (ReaderT (Rand.Gen (PrimState IO)) IO) SimState
+  -> (SimState -> Concrete Int)
+  -> Concrete SimState
 run rounds count f = do
   startingState <- initState count
   simulate startingState rounds f
@@ -109,18 +110,18 @@ argMaxIndex as f =
       biggestToSmallest = (List.sortOn (negative . snd) indexAndMagnitude)
   in biggestToSmallest ^? _head . _1
   where 
-    negative = (* (-1)) -- Swap the sign, so it's sorted biggest to smallest.
+    negative x = -x -- Swap the sign, so it's sorted biggest to smallest.
 
-choose :: SimState -> Traversal' SimState (IxValue [BanditState])
+-- | Choose the bandit with the highest Upper Confidence Bound
+choose :: SimState -> Int
 choose simState =
   let banditStats = simState ^.. bandits . each . _1
       curRound = simState ^. roundsCount
-      Just maxIndex = argMaxIndex banditStats (\stats -> ucb stats curRound)
-  in
-  bandits . ix maxIndex
+      Just maxIndex = argMaxIndex banditStats (ucb curRound)
+  in maxIndex
 
-ucb :: BanditStats -> Int -> Double
-ucb banditStats curRound  =
+ucb :: Int -> BanditStats -> Double
+ucb curRound banditStats =
   let totalTimesPulled = fromIntegral (banditStats ^. timesPulled)
       empiricalMean = (banditStats ^. totalReward) / totalTimesPulled
       t = fromIntegral curRound
@@ -130,12 +131,39 @@ ucb banditStats curRound  =
   where
     maxDouble = 100000000 -- TODO: What's the actual max double?
 
+-- | Choose a random bandit.
+chooseRandom :: BanditM m => SimState -> m Int
+chooseRandom simState = do
+    let count = fromIntegral $ length $ simState ^. bandits
+    let d = Stat.uniformDistr 0 (count - 1)
+    gen <- ask
+    rand <- liftIO $ Stat.genContVar d gen
+    return $ truncate rand
+
+-- | Pick the bandit with the best empirical mean.
+chooseBestMean :: SimState -> Int
+chooseBestMean simState =
+  let banditStats = simState ^.. bandits . each . _1
+      Just maxIndex = argMaxIndex banditStats avgReturn
+  in
+    maxIndex
+
+-- | Pick the bandit with the highest mean reward.
+godMode :: SimState -> Int
+godMode simState =
+  let bandits_ = simState ^.. bandits . each . _2
+      Just maxIndex = argMaxIndex bandits_ (\(Bandit d) -> Stat.mean d)
+  in
+    maxIndex
+
+avgReturn :: BanditStats -> Double
+avgReturn (BanditStats reward pulled) = reward / (fromIntegral pulled)
+
 main :: IO ()
 main = do
   (opts :: BanditOpts Unwrapped) <-unwrapRecord "Multi-armed bandit simulator."
   rand <- Rand.createSystemRandom
-  finalState <- runReaderT (run (optRounds opts) (optBandits opts) choose) rand
-  -- _ <- traverse (putStrLn . show) (finalState ^.. bandits . each)
+  finalState <- runReaderT (run (optRounds opts) (optBandits opts) (return . godMode)) rand
   _ <- traverse (putStrLn . show) (reverse (finalState ^. regretHist))
   return ()
   
